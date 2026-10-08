@@ -1,0 +1,742 @@
+import { getRequestCache } from '../lib/requestContext.js';
+import { executeWithRetry, isRetryable } from '../core/retry.js';
+import { measureExecution } from '../core/performanceMetrics.js';
+import { buildPagination } from '../utils/pagination.js';
+
+export class OrderRepository {
+  constructor(supabase) {
+    this.supabase = supabase;
+  }
+
+  async _cachedQuery(key, queryFn) {
+    const cache = getRequestCache();
+    if (cache && cache.has(key)) {
+      return cache.get(key);
+    }
+    const result = await queryFn();
+    if (cache && !result.error && result.data) {
+      cache.set(key, result);
+    }
+    return result;
+  }
+
+  async _retryableQuery(queryFn, operationName) {
+    return executeWithRetry(async () => {
+      let result;
+      try {
+        result = await measureExecution(`OrderRepository.${operationName}`, queryFn);
+      } catch (err) {
+        if (isRetryable(err)) {
+          throw err;
+        }
+        return { data: null, error: { message: err.message, code: err.code, status: err.status || 500 } };
+      }
+
+      if (result?.error && isRetryable(result.error)) {
+        const wrapped = new Error(result.error.message || 'Supabase error');
+        wrapped.code = result.error.code;
+        wrapped.status = result.error.status ?? result.error.code;
+        wrapped.details = result.error.details;
+        throw wrapped;
+      }
+
+      return result;
+    }, { operation: operationName });
+  }
+
+  // ===================================================================
+  // ORDERS
+  // ===================================================================
+
+  async createOrder(data) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .insert(data)
+      .select('id, order_display_id, status, created_at')
+      .single(), 'createOrder');
+  }
+
+  async findOrderById(id, columns = '*') {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select(columns)
+      .eq('id', id)
+      .maybeSingle(), 'findOrderById');
+  }
+
+  async findOrderByDisplayId(displayId, columns = '*') {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select(columns)
+      .eq('order_display_id', displayId)
+      .maybeSingle(), 'findOrderByDisplayId');
+  }
+  
+  async findOrderByAnyId(id, columns = '*') {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (uuidRegex.test(id)) {
+      const result = await this.findOrderById(id, columns);
+      if (result.data) return result;
+    }
+    return this.findOrderByDisplayId(id, columns);
+  }
+
+  async findOrderByIdOrDisplayId(id, columns = '*') {
+    return this.findOrderByAnyId(id, columns);
+  }
+
+  async findOrdersByCustomer(customerId, columns, statuses, orderColumn, ascending, pagination) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('orders')
+        .select(columns)
+        .eq('customer_id', customerId)
+        .in('status', statuses)
+        .order(orderColumn || 'pickup_date', { ascending: ascending ?? false });
+      if (pagination) {
+        const { from, to } = buildPagination(pagination);
+        query = query.range(from, to);
+      }
+      return query;
+    }, 'findOrdersByCustomer');
+  }
+
+  async findActiveOrderForDriverByCustomer(customerId, driverId, columns) {
+    const activeStatuses = ['pending', 'active', 'truck_assigned', 'en_route_pickup', 'arrived_pickup', 'picked_up', 'in_transit', 'arriving'];
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select(columns || 'id, order_display_id')
+      .eq('customer_id', customerId)
+      .eq('driver_id', driverId)
+      .in('status', activeStatuses)
+      .limit(1)
+      .maybeSingle(), 'findActiveOrderForDriverByCustomer');
+  }
+
+  async findOrdersWithCount(customerId, columns, pagination) {
+    const { page = 1, limit: perPage = 10 } = pagination || {};
+    const from = (page - 1) * perPage;
+    const to = from + perPage - 1;
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select(columns, { count: 'exact' })
+      .eq('customer_id', customerId)
+      .order('created_at', { ascending: false })
+      .range(from, to), 'findOrdersWithCount');
+  }
+
+  async findOrderForTimeline(id) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select('customer_id, driver_id, order_display_id')
+      .eq('id', id)
+      .maybeSingle(), 'findOrderForTimeline');
+  } 
+
+  async updateOrder(id, updates, eventType = null, idempotencyKey = null, client = null) {
+    const supabaseClient = client || this.supabase;
+
+    if (eventType) {
+      // Transactional outbox pattern: execute order mutation AND outbox event insertion
+      // atomically inside a single database transaction via PostgreSQL RPC.
+      // This eliminates the dual-write vulnerability where a crash between order UPDATE
+      // and outbox INSERT leaves the order committed while losing the outbox event (#11215).
+      return this._retryableQuery(async () => {
+        const payload = {
+          orderId: id,
+          status: updates?.status,
+          updates,
+        };
+
+        const rpcResult = await supabaseClient.rpc('order_update_with_outbox', {
+          p_order_id: id,
+          p_updates: updates || {},
+          p_event_type: eventType,
+          p_payload: payload,
+          p_idempotency_key: idempotencyKey || null,
+        }).single();
+
+        return rpcResult;
+      }, 'updateOrder:transactional');
+    }
+
+    return this._retryableQuery(() => supabaseClient
+      .from('orders')
+      .update(updates)
+      .eq('id', id)
+      .select('*')
+      .single(), 'updateOrder');
+  }
+
+  async updateDeliveryEtaState(id, updates, previousEta, previousState) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('orders')
+        .update(updates)
+        .eq('id', id)
+        .eq('delivery_delay_state', previousState);
+      query = previousEta == null ? query.is('eta', null) : query.eq('eta', previousEta);
+      return query.select('id, eta, delivery_delay_state').maybeSingle();
+    }, 'updateDeliveryEtaState');
+  }
+
+  async updateOrderWithFilter(id, updates, filters, selectColumns) {
+    return this._retryableQuery(() => {
+      let query = this.supabase.from('orders').update(updates).eq('id', id);
+      if (filters) {
+        for (const f of filters) {
+          if (f.op === 'eq') {
+            query = query.eq(f.column, f.value);
+          } else if (f.op === 'neq') {
+            query = query.neq(f.column, f.value);
+          } else if (f.op === 'not') {
+            query = query.not(f.column, f.operator, f.value);
+          } else if (f.op === 'in') {
+            query = query.in(f.column, f.value);
+          }
+        }
+      }
+      return query.select(selectColumns || 'cancellation_fee, order_display_id, status, cancellation_reason, escrow_status').single();
+    }, 'updateOrderWithFilter');
+  }
+
+  async updateOrderSelective(id, updates, selectColumns) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .update(updates)
+      .eq('id', id)
+      .select(selectColumns)
+      .single(), 'updateOrderSelective');
+  }
+
+  async updateOrderGuardStatus(orderId, updates, notStatuses) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('orders')
+        .update(updates)
+        .eq('id', orderId);
+      for (const status of notStatuses) {
+        query = query.not('status', 'eq', status);
+      }
+      return query.select('id, order_display_id, status').single();
+    }, 'updateOrderGuardStatus');
+  }
+
+  async findOrderAfterUpdate(orderId, columns) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select(columns)
+      .eq('id', orderId)
+      .maybeSingle(), 'findOrderAfterUpdate');
+  }
+
+  async deleteOrder(id) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .delete()
+      .eq('id', id), 'deleteOrder');
+  }
+
+  // ===================================================================
+  // TIMELINE
+  // ===================================================================
+
+  async createTimeline(entries) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .insert(entries), 'createTimeline');
+  }
+
+  async getTimeline(orderDisplayId) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .select('milestone, milestone_time, completed, sort_order')
+      .eq('order_display_id', orderDisplayId)
+      .order('sort_order', { ascending: true }), 'getTimeline');
+  }
+
+  async getTimelineWithSortCheck(orderDisplayId) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .select('milestone, sort_order, completed')
+      .eq('order_display_id', orderDisplayId)
+      .order('sort_order', { ascending: true }), 'getTimelineWithSortCheck');
+  }
+
+  async updateTimelineMilestone(orderDisplayId, milestone, updates) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .update(updates)
+      .eq('order_display_id', orderDisplayId)
+      .eq('milestone', milestone), 'updateTimelineMilestone');
+  }
+
+  async deleteTimeline(orderDisplayId) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .delete()
+      .eq('order_display_id', orderDisplayId), 'deleteTimeline');
+  }
+
+  async insertTimelineEntry(entry) {
+    return this._retryableQuery(() => this.supabase
+      .from('order_timeline')
+      .insert(entry), 'insertTimelineEntry');
+  }
+
+  // ===================================================================
+  // LOAD OFFERS
+  // ===================================================================
+
+  async createLoadOffer(data) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_offers')
+      .insert(data), 'createLoadOffer');
+  }
+
+  async findLoadOfferById(id, columns = '*') {
+    return this._retryableQuery(() => this.supabase
+      .from('load_offers')
+      .select(columns)
+      .eq('id', id)
+      .maybeSingle(), 'findLoadOfferById');
+  }
+
+  async findLoadOfferByOrderDisplayId(displayId) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_offers')
+      .select('id')
+      .eq('order_display_id', displayId)
+      .maybeSingle(), 'findLoadOfferByOrderDisplayId');
+  }
+
+  async findLoadOffers(filters, options = {}) {
+    return this._retryableQuery(() => {
+      let query = this.supabase.from('load_offers').select('*', options.count ? { count: 'exact' } : undefined);
+      if (filters) {
+        for (const [col, val] of Object.entries(filters)) {
+          query = query.eq(col, val);
+        }
+      }
+      query = query.order('created_at', { ascending: false });
+      if (options.pagination) {
+        const { from, to } = buildPagination(options.pagination);
+        query = query.range(from, to);
+      }
+      return query;
+    }, 'findLoadOffers');
+  }
+
+  async updateLoadOffer(orderDisplayId, updates) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_offers')
+      .update(updates)
+      .eq('order_display_id', orderDisplayId), 'updateLoadOffer');
+  }
+
+  async deleteLoadOffer(orderDisplayId) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_offers')
+      .delete()
+      .eq('order_display_id', orderDisplayId), 'deleteLoadOffer');
+  }
+
+  // ===================================================================
+  // BIDS
+  // ===================================================================
+
+  async createBid(data) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_bids')
+      .insert(data)
+      .select('*')
+      .single(), 'createBid');
+  }
+
+  async findBidById(id) {
+    return this._retryableQuery(() => this.supabase
+      .from('load_bids')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle(), 'findBidById');
+  }
+
+  async findBidsByLoad(loadId, status, options = {}) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('load_bids')
+        .select('*', options.count ? { count: 'exact' } : undefined)
+        .eq('load_id', loadId);
+      if (status) {
+        query = query.eq('status', status);
+      }
+      if (options.orderBy) {
+        query = query.order(options.orderBy, { ascending: options.ascending ?? true });
+      }
+      if (options.pagination) {
+        const { from, to } = buildPagination(options.pagination);
+        query = query.range(from, to);
+      }
+      return query;
+    }, 'findBidsByLoad');
+  }
+
+  async findExistingBid(loadId, driverId, status) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('load_bids')
+        .select('id')
+        .eq('load_id', loadId)
+        .eq('driver_id', driverId);
+      if (status) {
+        query = query.eq('status', status);
+      }
+      return query.maybeSingle();
+    }, 'findExistingBid');
+  }
+
+  // ===================================================================
+  // RATINGS
+  // ===================================================================
+
+  async findRatingByOrder(orderDisplayId, customerId) {
+    return this._retryableQuery(() => this.supabase
+      .from('ratings')
+      .select('id')
+      .eq('order_display_id', orderDisplayId)
+      .eq('customer_id', customerId)
+      .maybeSingle(), 'findRatingByOrder');
+  }
+
+  async findRatingsForCustomer(customerId) {
+    return this._retryableQuery(() => this.supabase
+      .from('ratings')
+      .select('order_display_id, stars')
+      .eq('customer_id', customerId), 'findRatingsForCustomer');
+  }
+
+  // ===================================================================
+  // RPC
+  // ===================================================================
+
+  async executeRpc(name, params, client) {
+    if (!client) {
+      throw new Error(
+        `executeRpc("${name}") requires a Supabase client. Pass the per-request user client so auth.uid() resolves to the caller instead of falling back to the shared anon-key client.`
+      );
+    }
+    return this._retryableQuery(() => client.rpc(name, params), `executeRpc:${name}`);
+  }
+
+  // ===================================================================
+  // PROFILES (read-only lookups for order context)
+  // ===================================================================
+
+  async findProfilesByIds(ids, columns = 'id, full_name') {
+    return this._retryableQuery(() => this.supabase
+      .from('profiles')
+      .select(columns)
+      .in('id', ids), 'findProfilesByIds');
+  }
+
+  async findProfile(userId, columns = 'full_name, phone, avatar_url') {
+    return this._retryableQuery(() => this.supabase
+      .from('profiles')
+      .select(columns)
+      .eq('id', userId)
+      .maybeSingle(), 'findProfile');
+  }
+
+  async findCustomerWallet(userId) {
+    return this._retryableQuery(() => this.supabase
+      .from('profiles')
+      .select('polygon_wallet_address')
+      .eq('id', userId)
+      .maybeSingle(), 'findCustomerWallet');
+  }
+
+  // ===================================================================
+  // DRIVER DETAILS (read-only lookups for order context)
+  // ===================================================================
+
+  async findDriverDetail(userId, columns = 'polygon_wallet_address, rating, truck_id, total_trips') {
+    return this._retryableQuery(() => this.supabase
+      .from('driver_details')
+      .select(columns)
+      .eq('user_id', userId)
+      .maybeSingle(), 'findDriverDetail');
+  }
+
+  async findDriverDetails(userIds) {
+    return this._retryableQuery(() => this.supabase
+      .from('driver_details')
+      .select('user_id, rating, total_trips, completion_rate, truck_id')
+      .in('user_id', userIds), 'findDriverDetails');
+  }
+
+  async findDriverDetailMinimal(userId) {
+    return this._retryableQuery(() => this.supabase
+      .from('driver_details')
+      .select('truck_id')
+      .eq('user_id', userId)
+      .maybeSingle(), 'findDriverDetailMinimal');
+  }
+
+  async findDriverWallet(userId) {
+    return this._retryableQuery(() => this.supabase
+      .from('driver_details')
+      .select('polygon_wallet_address')
+      .eq('user_id', userId)
+      .maybeSingle(), 'findDriverWallet');
+  }
+
+  async findDriverDetailWithRating(userId) {
+    return this._retryableQuery(() => this.supabase
+      .from('driver_details')
+      .select('rating, truck_id')
+      .eq('user_id', userId)
+      .maybeSingle(), 'findDriverDetailWithRating');
+  }
+
+  // ===================================================================
+  // TRUCKS (read-only lookups for order context)
+  // ===================================================================
+
+  async findTruckById(id, columns = 'id') {
+    if (!id) return { data: null, error: null };
+    return this._retryableQuery(() => this.supabase
+      .from('trucks')
+      .select(columns)
+      .eq('id', id)
+      .maybeSingle(), 'findTruckById');
+  }
+
+  async findTruckWithDetails(id) {
+    if (!id) return { data: null, error: null };
+    return this._retryableQuery(() => this.supabase
+      .from('trucks')
+      .select('id, name, number_plate')
+      .eq('id', id)
+      .maybeSingle(), 'findTruckWithDetails');
+  }
+
+  async findTrucksByIds(ids) {
+    if (!ids || ids.length === 0) return { data: [], error: null };
+    return this._retryableQuery(() => this.supabase
+      .from('trucks')
+      .select('id, name, number_plate')
+      .in('id', ids), 'findTrucksByIds');
+  }
+
+  // ===================================================================
+  // DELIVERY OTPS
+  // ===================================================================
+
+  async findVerifiedDeliveryOtp(orderId, client) {
+    return this._retryableQuery(() => (client ?? this.supabase)
+      .from('delivery_otps')
+      .select('id')
+      .eq('order_id', orderId)
+      .eq('verified', true)
+      .limit(1)
+      .maybeSingle(), 'findVerifiedDeliveryOtp');
+  }
+
+  // ===================================================================
+  // WALLET TRANSACTIONS
+  // ===================================================================
+
+  async updateWalletTransaction(driverId, orderDisplayId, updates) {
+    return this._retryableQuery(() => this.supabase
+      .from('wallet_transactions')
+      .update(updates)
+      .eq('driver_id', driverId)
+      .eq('order_display_id', orderDisplayId)
+      .eq('txn_type', 'credit')
+      .order('id', { ascending: false })
+      .limit(1), 'updateWalletTransaction');
+  }
+
+  // ===================================================================
+  // ESCROW
+  // ===================================================================
+
+  async updateEscrowBooking(orderId, bookingId, escrowStatus, extra = {}, filters) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('orders')
+        .update({
+          escrow_booking_id: bookingId,
+          escrow_status: escrowStatus,
+          ...extra,
+        })
+        .eq('id', orderId);
+      if (filters) {
+        for (const f of filters) {
+          if (f.op === 'eq') {
+            query = query.eq(f.column, f.value);
+          } else if (f.op === 'is') {
+            query = query.is(f.column, f.value);
+          } else if (f.op === 'or') {
+            query = query.or(f.value);
+          }
+        }
+      }
+      return query.select('id, escrow_status, pending_bid_acceptance').single();
+    }, 'updateEscrowBooking');
+  }
+
+  async revertEscrowStatus(orderId) {
+    // Guard the revert to 'pending' so it can never clobber a concurrent
+    // escrow transition (e.g. the stale-order worker moving a funded order
+    // into 'refund_pending'). Only states this method legitimately reverts
+    // are 'funding'/'funded'.
+    //
+    // This releases the WHOLE bid reservation, not just the escrow flag.
+    // Two-phase bid acceptance (#5724) stores the reserved bid in
+    // pending_bid_acceptance, and acceptBid only re-reserves an order whose
+    // pending_bid_acceptance IS NULL (see ESCROW_RESET_GUARD_FILTERS). If it
+    // were left set here, the order would be back in 'pending' but could never
+    // accept another bid (permanent 409 "already has an active escrow flow"),
+    // and escrowFundingReconciliation could not rescue it because it only
+    // scans escrow_status = 'funding'. Clearing it in the same UPDATE keeps the
+    // release atomic for every caller and matches the reset the funding
+    // reconciler performs when it expires a reservation.
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .update({
+        escrow_status: 'pending',
+        escrow_booking_id: null,
+        pending_bid_acceptance: null,
+        escrow_funding_started_at: null,
+        escrow_funding_attempts: 0,
+        escrow_funding_last_attempt_at: null,
+        escrow_funding_error: null,
+      })
+      .eq('id', orderId)
+      .in('escrow_status', ['funding', 'funded']), 'revertEscrowStatus');
+  }
+
+  // ===================================================================
+  // STALE ORDER CANCELLATION
+  // ===================================================================
+
+  async findStalePendingOrders(cutoff, limit) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select('id')
+      .eq('status', 'pending')
+      .lt('created_at', cutoff)
+      .or('escrow_status.is.null,escrow_status.neq.funding')
+      .limit(limit), 'findStalePendingOrders');
+  }
+
+  async cancelStaleOrder(orderId, cancellationReason, staleSince, client) {
+    const supabaseClient = client || this.supabase;
+    return this._retryableQuery(() => supabaseClient
+      .rpc('cancel_stale_order_tx', {
+        p_order_id: orderId,
+        p_cancellation_reason: cancellationReason,
+        p_stale_since: staleSince,
+      }), 'cancelStaleOrder');
+  }
+
+  async findStaleFundingOrders(cutoff, { after, offset = 0, limit = 1000 } = {}) {
+    return this._retryableQuery(() => {
+      let query = this.supabase
+        .from('orders')
+        .select('id, order_display_id, customer_id, escrow_booking_id, escrow_amount_wei, status, cancellation_fee, total_amount, pending_bid_acceptance, escrow_funding_attempts, escrow_funding_last_attempt_at')
+        .eq('escrow_status', 'funding')
+        .not('pending_bid_acceptance', 'is', null)
+        .or('escrow_funding_attempts.lt.10,escrow_funding_attempts.is.null')
+        .or(`escrow_funding_started_at.lt.${cutoff},and(escrow_funding_started_at.is.null,updated_at.lt.${cutoff})`)
+        .order('updated_at', { ascending: true })
+        .order('id', { ascending: true });
+
+      if (after) {
+        if (typeof after === 'object' && after.updated_at && after.id) {
+          query = query.or(`updated_at.gt.${after.updated_at},and(updated_at.eq.${after.updated_at},id.gt.${after.id})`);
+        } else if (typeof after === 'string' && after.includes(',')) {
+          const [ts, idVal] = after.split(',');
+          query = query.or(`updated_at.gt.${ts},and(updated_at.eq.${ts},id.gt.${idVal})`);
+        } else if (typeof after === 'string' && after.includes('|')) {
+          const [ts, idVal] = after.split('|');
+          query = query.or(`updated_at.gt.${ts},and(updated_at.eq.${ts},id.gt.${idVal})`);
+        } else {
+          query = query.gt('updated_at', after);
+        }
+      }
+
+      if (typeof limit === 'number') {
+        query = query.limit(limit);
+      } else {
+        query = query.range(offset, offset + Math.max(1, limit) - 1);
+      }
+      return query;
+    }, 'findStaleFundingOrders');
+  }
+
+  // ===================================================================
+  // REPUTATION FAILURES
+  // ===================================================================
+
+  async insertReputationFailure(data) {
+    const payload = {
+      status: 'pending',
+      ...data,
+    };
+    return this._retryableQuery(() => this.supabase
+      .from('reputation_failures')
+      .insert(payload), 'insertReputationFailure');
+  }
+
+  // ===================================================================
+  // ESCROW REFUND RECONCILIATION
+  // ===================================================================
+
+  async findPendingEscrowRefunds() {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select('id, order_display_id, refund_tx_hash, escrow_status, escrow_refund_attempts, updated_at, cancellation_fee, escrow_amount_wei, total_amount')
+      .in('escrow_status', ['refund_pending', 'refund_failed'])
+      .limit(50), 'findPendingEscrowRefunds');
+  }
+
+  async claimRefundReconciliation(orderId, instanceId, leaseSeconds, client) {
+    const supabaseClient = client || this.supabase;
+    return this._retryableQuery(() => supabaseClient
+      .rpc('claim_refund_reconciliation', {
+        p_order_id: orderId,
+        p_instance_id: instanceId,
+        p_lease_seconds: leaseSeconds,
+      }), 'claimRefundReconciliation');
+  }
+
+  // ===================================================================
+  // ESCROW RELEASE RECONCILIATION
+  // ===================================================================
+
+  /**
+   * Selects orders whose on-chain escrow release may have completed without
+   * the trip being finalized. Covers the exact failure window: a release that
+   * succeeded on-chain but whose `complete_trip_tx` never ran (or whose
+   * release evidence was never persisted), leaving the order at
+   * `status <> 'payment_released'`.
+   *
+   * Plain `funded` orders that are still awaiting delivery are included so the
+   * worker can consult the on-chain booking and heal the release if it did in
+   * fact land; orders still waiting are skipped without side effects. The
+   * attempt budget excludes orders already escalated to manual review.
+   */
+  async findPendingEscrowReleases(limit = 50) {
+    return this._retryableQuery(() => this.supabase
+      .from('orders')
+      .select('id, order_display_id, status, escrow_status, escrow_disabled, escrow_booking_id, escrow_release_attempts, escrow_release_last_attempt_at, escrow_release_error, release_tx_hash, escrow_released_at')
+      .in('escrow_status', ['release_failed', 'released', 'funded'])
+      .neq('status', 'payment_released')
+      .or('escrow_release_attempts.lt.10,escrow_release_attempts.is.null')
+      .order('escrow_release_attempts', { ascending: false })
+      .limit(limit), 'findPendingEscrowReleases');
+  }
+}
+

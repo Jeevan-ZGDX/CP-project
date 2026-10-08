@@ -1,0 +1,404 @@
+import express from 'express';
+import crypto from 'crypto';
+import { cacheMiddleware } from '../middleware/cacheMiddleware.js';
+// Verified single import for predictEta to prevent SyntaxError (#14873)
+import { predictDemand, predictPrice, predictEta, matchEnRouteLoads, getAbTestingStatus, rollbackAbTest } from '../services/ml.js';
+import { supabase } from '../config/db.js';
+import { authenticate, requireRole } from '../middleware/auth.js';
+import { userLimiter } from '../middleware/rateLimiter.js';
+import logger from '../middleware/logger.js';
+import { haversineKm } from '../lib/pricing.js';
+
+const router = express.Router();
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     MlEtaResponse:
+ *       type: object
+ *       required:
+ *         - eta_minutes
+ *         - confidence_interval
+ *       properties:
+ *         eta_minutes:
+ *           type: number
+ *           format: float
+ *           minimum: 0
+ *           example: 25.5
+ *         confidence_interval:
+ *           type: object
+ *           required:
+ *             - lower
+ *             - upper
+ *           properties:
+ *             lower:
+ *               type: number
+ *               format: float
+ *               minimum: 0
+ *               example: 20
+ *             upper:
+ *               type: number
+ *               format: float
+ *               minimum: 0
+ *               example: 30
+ */
+
+function parseCoord(value, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+
+const LAT_MIN = -90;
+const LAT_MAX = 90;
+const LNG_MIN = -180;
+const LNG_MAX = 180;
+const MAX_DETOUR_MIN_KM = 0.1;
+const MAX_DETOUR_MAX_KM = 500;
+const DEFAULT_MAX_DETOUR_KM = 10;
+
+// ============================================================================
+// 1. GET DEMAND HEATMAP
+// GET /api/ml/demand-heatmap
+// ============================================================================
+router.get(
+  '/demand-heatmap',
+  authenticate,
+  userLimiter,
+  cacheMiddleware(300, 'ml_demand_heatmap', (req) => {
+    return req.query.zoneId || 'default';
+  }),
+  async (req, res) => {
+    const { zoneId } = req.query;
+    try {
+      const result = await predictDemand({ zone_id: zoneId || 'zone-1' });
+      return res.json(result);
+    } catch (err) {
+      logger.warn({ err: err.message }, '[ML] Heatmap fallback');
+      // Fallback
+      return res.json({
+        zone_id: zoneId || 'zone-1',
+        predicted_demand: 0.75,
+        confidence: 0.85,
+        recommended_multipliers: { base: 1.2, rush: 1.5 }
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 3. GET ETA PREDICTION
+// GET /api/ml/eta
+// ============================================================================
+/**
+ * @swagger
+ * /api/ml/eta:
+ *   get:
+ *     summary: Get an ML-based ETA prediction
+ *     description: Predicts ETA from route distance, time-of-day, day-of-week, route type, and historical speed. Optional trip and GPS query values are also included in the short-lived response-cache key.
+ *     tags:
+ *       - Machine Learning
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: routeDistance
+ *         required: false
+ *         description: Route distance in kilometres. Defaults to 10.
+ *         schema:
+ *           type: number
+ *           format: float
+ *           minimum: 0
+ *           default: 10
+ *       - in: query
+ *         name: timeOfDay
+ *         required: false
+ *         description: Hour of day used by the ETA model. Defaults to 12.
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           maximum: 23
+ *           default: 12
+ *       - in: query
+ *         name: dayOfWeek
+ *         required: false
+ *         description: Day of week where 0 is Sunday and 6 is Saturday. Defaults to 1.
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           maximum: 6
+ *           default: 1
+ *       - in: query
+ *         name: routeType
+ *         required: false
+ *         description: Route classification supplied to the ETA model.
+ *         schema:
+ *           type: string
+ *           default: highway
+ *           example: highway
+ *       - in: query
+ *         name: historicalSpeed
+ *         required: false
+ *         description: Historical average speed in kilometres per hour. Defaults to 60.
+ *         schema:
+ *           type: number
+ *           format: float
+ *           minimum: 0
+ *           default: 60
+ *       - in: query
+ *         name: tripId
+ *         required: false
+ *         description: Optional trip identifier used to separate cached ETA responses.
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: lat
+ *         required: false
+ *         description: Optional latitude value used in the response-cache key.
+ *         schema:
+ *           type: number
+ *           format: float
+ *           minimum: -90
+ *           maximum: 90
+ *       - in: query
+ *         name: lng
+ *         required: false
+ *         description: Optional longitude value used in the response-cache key.
+ *         schema:
+ *           type: number
+ *           format: float
+ *           minimum: -180
+ *           maximum: 180
+ *     responses:
+ *       '200':
+ *         description: ETA prediction from the ML engine or deterministic fallback.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/MlEtaResponse'
+ */
+router.get(
+  '/eta',
+  authenticate,
+  userLimiter,
+  cacheMiddleware(10, 'ml_eta', (req) => {
+    const tripId = req.query.tripId || 'unknown';
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    const latBucket = lat ? lat.toFixed(4) : '';
+    const lngBucket = lng ? lng.toFixed(4) : '';
+    const gpsBucket = `${latBucket},${lngBucket}`;
+    const routeDistance = req.query.routeDistance || '10';
+    const timeOfDay = req.query.timeOfDay || '12';
+    const dayOfWeek = req.query.dayOfWeek || '1';
+    const routeType = req.query.routeType || 'highway';
+    const historicalSpeed = req.query.historicalSpeed || '60';
+    return `${tripId}:${gpsBucket}:${routeDistance}:${timeOfDay}:${dayOfWeek}:${routeType}:${historicalSpeed}`;
+  }),
+  async (req, res) => {
+    const { routeDistance, timeOfDay, dayOfWeek, routeType, historicalSpeed } = req.query;
+    try {
+      const result = await predictEta({
+        routeDistance: parseFloat(routeDistance || '10'),
+        timeOfDay: parseInt(timeOfDay || '12', 10),
+        dayOfWeek: parseInt(dayOfWeek || '1', 10),
+        routeType: routeType || 'highway',
+        historicalSpeed: parseFloat(historicalSpeed || '60')
+      });
+      return res.json(result);
+    } catch (err) {
+      logger.warn({ err: err.message }, '[ML] ETA fallback');
+      // Fallback
+      return res.json({
+        eta_minutes: 25.5,
+        confidence_interval: { lower: 20, upper: 30 }
+      });
+    }
+  }
+);
+
+// ============================================================================
+// 4. GET ENROUTE LOADS
+// GET /api/ml/enroute-loads
+// ============================================================================
+router.get(
+  '/enroute-loads',
+  authenticate,
+  userLimiter,
+  async (req, res) => {
+    const { lat, lng, maxDetour } = req.query;
+    try {
+      const currentLat = parseCoord(lat, LAT_MIN, LAT_MAX);
+      const currentLng = parseCoord(lng, LNG_MIN, LNG_MAX);
+
+      if (currentLat === null || currentLng === null) {
+        return res.status(400).json({
+          error: `lat must be a number between ${LAT_MIN} and ${LAT_MAX} and lng a number between ${LNG_MIN} and ${LNG_MAX}.`,
+        });
+      }
+
+      // An unparseable maxDetour used to reach the haversine fallback as NaN,
+      // where `x <= NaN` is always false — the endpoint answered 200 with an
+      // empty list, hiding a client error as "no en-route loads".
+      const maxDetourKm =
+        maxDetour === undefined
+          ? DEFAULT_MAX_DETOUR_KM
+          : parseCoord(maxDetour, MAX_DETOUR_MIN_KM, MAX_DETOUR_MAX_KM);
+
+      if (maxDetourKm === null) {
+        return res.status(400).json({
+          error: `maxDetour must be a number between ${MAX_DETOUR_MIN_KM} and ${MAX_DETOUR_MAX_KM}.`,
+        });
+      }
+
+      // 1. Fetch available load offers
+      const { data: offers, error: offersError } = await supabase
+        .from('load_offers')
+        .select('*')
+        .eq('status', 'available');
+
+      if (offersError) {
+        logger.error('Failed to fetch available offers for en-route matching:', offersError);
+        return res.status(500).json({ error: 'Failed to fetch available load offers.' });
+      }
+
+      // 2. Fetch driver's details to get truck specs
+      const { data: details } = await supabase
+        .from('driver_details')
+        .select('truck_id')
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+
+      let truckSpecs = null;
+      if (details?.truck_id) {
+        const { data: truck } = await supabase
+          .from('trucks')
+          .select('*')
+          .eq('id', details.truck_id)
+          .maybeSingle();
+
+        if (truck) {
+          truckSpecs = {
+            max_weight_kg: (truck.max_capacity_tons || 1.5) * 1000,
+            max_length_m: 4.0,
+            max_width_m: 2.0,
+            max_height_m: 2.0,
+          };
+        }
+      }
+
+      // 3. Call ML matching
+      const recommendations = await matchEnRouteLoads({
+        currentLat,
+        currentLng,
+        offers: offers || [],
+        truckSpecs,
+        maxDetourKm,
+      });
+
+      return res.json({ recommendations });
+    } catch (err) {
+      logger.error({ err: err.message }, '[ML] En-route loads error');
+      return res.status(500).json({ error: 'An error occurred during en-route loads matching.' });
+    }
+  }
+);
+// ============================================================================
+// 5. A/B TESTING STATUS & ROLLBACK (ADMIN PROXIED)
+// ============================================================================
+/**
+ * @openapi
+ * components:
+ *   securitySchemes:
+ *     BearerAuth:
+ *       type: http
+ *       scheme: bearer
+ *       bearerFormat: JWT
+ *   schemas:
+ *     MlAbTestingStatusResponse:
+ *       type: object
+ *       required: [status, active_test, timestamp]
+ *       properties:
+ *         status:
+ *           type: string
+ *           enum: [active]
+ *           description: Current A/B testing lifecycle status.
+ *           example: active
+ *         active_test:
+ *           type: object
+ *           nullable: true
+ *           required: [test_id, production_version, shadow_version, started_at, status]
+ *           properties:
+ *             test_id:
+ *               type: string
+ *               example: test-2026-09-19
+ *             production_version:
+ *               type: string
+ *               example: generation-42
+ *             shadow_version:
+ *               type: string
+ *               example: generation-43
+ *             started_at:
+ *               type: string
+ *               format: date-time
+ *             status:
+ *               type: string
+ *               example: active
+ *         timestamp:
+ *           type: string
+ *           format: date-time
+ * /api/ml/ab-testing/status:
+ *   get:
+ *     tags: [ML A/B Testing]
+ *     summary: Get ML A/B-testing status
+ *     description: Returns the current ML A/B-testing status and active test metadata for administrators.
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Current A/B-testing status.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/MlAbTestingStatusResponse'
+ *       401:
+ *         description: Authentication is required.
+ *       403:
+ *         description: Caller does not have administrator privileges.
+ *       429:
+ *         description: Rate limit exceeded.
+ *       502:
+ *         description: Failed to fetch A/B-testing status from the ML engine.
+ */
+router.get(
+  '/ab-testing/status',
+  authenticate,
+  requireRole(['admin']),
+  async (req, res) => {
+    try {
+      const status = await getAbTestingStatus();
+      return res.json(status);
+    } catch (err) {
+      logger.error({ err: err.message }, '[ML] Failed to fetch A/B testing status');
+      return res.status(502).json({ error: 'Failed to fetch A/B testing status from ML engine.' });
+    }
+  }
+);
+
+router.post(
+  '/ab-testing/rollback/:testId',
+  authenticate,
+  requireRole(['admin']),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const result = await rollbackAbTest(testId);
+      return res.json(result);
+    } catch (err) {
+      logger.error({ err: err.message }, '[ML] Failed to rollback A/B test');
+      return res.status(502).json({ error: 'Failed to trigger rollback on ML engine.' });
+    }
+  }
+);
+
+export default router;

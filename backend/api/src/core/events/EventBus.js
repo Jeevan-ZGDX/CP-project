@@ -1,0 +1,424 @@
+import EventEmitter from 'events';
+import { performance } from 'node:perf_hooks';
+import logger from '../../middleware/logger.js';
+import { EventMetadata, EVENT_CATEGORIES } from './EventMetadata.js';
+import { EventRegistry } from './EventRegistry.js';
+import { ContextPropagator } from '../telemetry/ContextPropagator.js';
+import { context, trace, SpanStatusCode } from '@opentelemetry/api';
+import spanFactory, { STANDARD_ATTRIBUTES } from '../telemetry/SpanFactory.js';
+
+const MAX_DEDUPLICATION_ENTRIES = 10_000;
+
+class EventBus extends EventEmitter {
+  constructor() {
+    super();
+    this.setMaxListeners(50);
+    this._adapters = new Map();
+    this._registry = new EventRegistry();
+    this._deduplication = new Map();
+    this._deduplicationWindowMs = 60000;
+    this._deduplicationCleanupTimer = null;
+    this._listenerWrappers = new Map();
+    this._metrics = {
+      published: 0,
+      subscribed: 0,
+      errors: 0,
+      deduplicated: 0,
+    };
+  }
+
+  get registry() {
+    return this._registry;
+  }
+
+  get metrics() {
+    return { ...this._metrics };
+  }
+
+  registerAdapter(name, adapter) {
+    this._adapters.set(name, adapter);
+    logger.info({ adapter: name }, '[EventBus] Adapter registered');
+    return this;
+  }
+
+  removeAdapter(name) {
+    this._adapters.delete(name);
+    logger.info({ adapter: name }, '[EventBus] Adapter removed');
+    return this;
+  }
+
+  async connectAdapters() {
+    for (const [name, adapter] of this._adapters) {
+      try {
+        if (typeof adapter.connect === 'function') {
+          await adapter.connect();
+          logger.info({ adapter: name }, '[EventBus] Adapter connected');
+        }
+      } catch (err) {
+        logger.error({ adapter: name, err: err.message }, '[EventBus] Failed to connect adapter');
+      }
+    }
+  }
+
+  async disconnectAdapters() {
+    for (const [name, adapter] of this._adapters) {
+      try {
+        if (typeof adapter.disconnect === 'function') {
+          await adapter.disconnect();
+          logger.info({ adapter: name }, '[EventBus] Adapter disconnected');
+        }
+      } catch (err) {
+        logger.error({ adapter: name, err: err.message }, '[EventBus] Failed to disconnect adapter');
+      }
+    }
+  }
+
+  publish(eventOrType, payloadOrOptions, optionsOrUndefined) {
+    let event;
+    let options;
+
+    if (eventOrType && typeof eventOrType === 'object' && eventOrType.metadata) {
+      event = eventOrType;
+      options = payloadOrOptions || {};
+    } else if (typeof eventOrType === 'string') {
+      const eventType = eventOrType;
+      const payload = payloadOrOptions;
+      options = optionsOrUndefined || {};
+
+      const metadata = new EventMetadata({
+        eventType,
+        source: options.source,
+        category: options.category || EVENT_CATEGORIES.DOMAIN,
+        version: options.version,
+        correlationId: options.correlationId,
+      });
+
+      event = {
+        metadata,
+        payload: payload !== undefined ? payload : {},
+      };
+    } else {
+      throw new Error('EventBus.publish() requires either a BaseEvent instance or (eventType, payload, options)');
+    }
+
+    const eventType = event.metadata?.eventType || event.eventType;
+    const source = event.metadata?.source || 'unknown';
+    const eventId = event.metadata?.eventId;
+
+    if (this._registry.isValid(eventType)) {
+      const validation = this._registry.validate(eventType, event.payload);
+      if (!validation.valid) {
+        logger.warn({ eventType, error: validation.error }, '[EventBus] Event validation failed');
+      }
+    }
+
+    if (options.deduplicate !== false && this._isDuplicate(event)) {
+      this._metrics.deduplicated++;
+      logger.debug({ eventId: event.metadata?.eventId }, '[EventBus] Duplicate event suppressed');
+      return this;
+    }
+
+    const traceSnapshot = ContextPropagator.snapshot();
+
+    const enrichedEvent = ContextPropagator.injectIntoEventPayload(event);
+
+    const span = spanFactory.startEventPublishSpan(eventType, { source, eventId });
+
+    try {
+      context.with(trace.setSpan(context.active(), span), () => {
+        this._metrics.published++;
+        this.emitSafe(eventType, enrichedEvent);
+
+        if (options.adapters !== false) {
+          this._publishToAdapters(enrichedEvent, options);
+        }
+      });
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+    } catch (error) {
+      spanFactory.recordError(span, error);
+      span.end();
+      throw error;
+    }
+
+    return this;
+  }
+
+  emitSafe(event, ...args) {
+    const listeners = this.rawListeners(event);
+    const promises = [];
+    for (const listener of listeners) {
+      try {
+        const result = listener.apply(this, args);
+        if (result && typeof result.then === 'function') {
+          // Capture the async listener's rejection but do not block other listeners.
+          const p = result.catch(err => {
+            logger.error({ event, err }, '[EventBus] Unhandled async listener error');
+            this._metrics.errors++;
+          });
+          promises.push(p);
+        }
+      } catch (err) {
+        logger.error({ event, err }, '[EventBus] Sync listener error');
+        this._metrics.errors++;
+      }
+    }
+    // Return a promise that resolves when all async listeners have settled.
+    // Await this in the caller to confirm all listeners completed before
+    // marking an event as successfully published.
+    if (promises.length > 0) {
+      return Promise.allSettled(promises).then(() => listeners.length > 0);
+    }
+    return listeners.length > 0;
+  }
+
+  subscribe(eventType, handler) {
+    if (typeof handler === 'function') {
+      this._metrics.subscribed++;
+      const tracedHandler = (event) => {
+        const parentCtx = event?.metadata?.traceContext
+          ? ContextPropagator.extractFromEventPayload(event)
+          : undefined;
+
+        const span = spanFactory.startEventSubscribeSpan(eventType, {
+          source: event?.metadata?.source || 'unknown',
+        });
+
+        const runContext = parentCtx || context.active();
+        return context.with(trace.setSpan(runContext, span), async () => {
+          try {
+            const result = await handler(event);
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+            return result;
+          } catch (error) {
+            spanFactory.recordError(span, error);
+            span.end();
+            throw error;
+          }
+        });
+      };
+      this._registerListener(eventType, handler, tracedHandler);
+      return this;
+    }
+
+    if (handler && typeof handler.handle === 'function') {
+      this._metrics.subscribed++;
+      const instanceHandler = (event) => handler.handle(event);
+      this._registerListener(eventType, handler, instanceHandler);
+      return this;
+    }
+
+    throw new Error('subscribe() requires a function or EventHandler instance');
+  }
+
+  _registerListener(eventType, handler, listener) {
+    let byHandler = this._listenerWrappers.get(eventType);
+    if (!byHandler) {
+      byHandler = new Map();
+      this._listenerWrappers.set(eventType, byHandler);
+    }
+    const listeners = byHandler.get(handler);
+    if (listeners) {
+      listeners.push(listener);
+    } else {
+      byHandler.set(handler, [listener]);
+    }
+    this.on(eventType, listener);
+  }
+
+  unsubscribe(eventType, handler) {
+    const byHandler = this._listenerWrappers.get(eventType);
+    const listeners = byHandler?.get(handler);
+    if (listeners) {
+      for (const listener of listeners) {
+        this.removeListener(eventType, listener);
+      }
+      byHandler.delete(handler);
+      if (byHandler.size === 0) {
+        this._listenerWrappers.delete(eventType);
+      }
+    }
+    return this;
+  }
+
+  async publishAsync(eventOrType, payloadOrOptions, options) {
+    return new Promise((resolve, reject) => {
+      try {
+        this.publish(eventOrType, payloadOrOptions, options);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  /**
+   * Like `publish`, but awaits adapter delivery and returns a structured
+   * outcome so callers can tell whether an event was actually consumed.
+   *
+   * `publish` (and therefore `publishAsync`) swallows adapter/lisener errors
+   * internally, which means a caller cannot distinguish "delivered" from
+   * "no consumer handled it / a consumer failed". The transactional outbox
+   * relay relies on this signal to decide whether to mark an outbox row as
+   * published or failed (see issue #11209).
+   */
+  async publishAndReport(eventOrType, payloadOrOptions, options = {}) {
+    let event;
+    let eventType;
+
+    if (eventOrType && typeof eventOrType === 'object' && eventOrType.metadata) {
+      event = eventOrType;
+      eventType = event.metadata?.eventType || event.eventType;
+    } else if (typeof eventOrType === 'string') {
+      eventType = eventOrType;
+      const metadata = new EventMetadata({
+        eventType,
+        source: options.source,
+        category: options.category || EVENT_CATEGORIES.DOMAIN,
+        version: options.version,
+        correlationId: options.correlationId,
+      });
+      event = {
+        metadata,
+        payload: payloadOrOptions !== undefined ? payloadOrOptions : {},
+      };
+    } else {
+      throw new Error('EventBus.publishAndReport() requires either a BaseEvent instance or (eventType, payload, options)');
+    }
+
+    if (this._registry.isValid(eventType)) {
+      const validation = this._registry.validate(eventType, event.payload);
+      if (!validation.valid) {
+        logger.warn({ eventType, error: validation.error }, '[EventBus] Event validation failed');
+      }
+    }
+
+    if (options.deduplicate !== false && this._isDuplicate(event)) {
+      this._metrics.deduplicated++;
+      logger.debug({ eventId: event.metadata?.eventId }, '[EventBus] Duplicate event suppressed');
+      return {
+        published: false,
+        deduplicated: true,
+        consumed: false,
+        adapterAttempted: 0,
+        adapterFailures: 0,
+        adapterErrors: [],
+      };
+    }
+
+    const traceSnapshot = ContextPropagator.snapshot();
+    const enrichedEvent = ContextPropagator.injectIntoEventPayload(event);
+    const source = event.metadata?.source || 'unknown';
+    const eventId = event.metadata?.eventId;
+
+    const span = spanFactory.startEventPublishSpan(eventType, { source, eventId });
+
+    const consumed = this.emitSafe(eventType, enrichedEvent);
+
+    const targetAdapters = options.adapters || null;
+    let adapterAttempted = 0;
+    let adapterFailures = 0;
+    const adapterErrors = [];
+
+    for (const [name, adapter] of this._adapters) {
+      if (targetAdapters && !targetAdapters.includes(name)) continue;
+      adapterAttempted++;
+      try {
+        if (typeof adapter.publish === 'function') {
+          await adapter.publish(enrichedEvent);
+        }
+      } catch (err) {
+        adapterFailures++;
+        adapterErrors.push(`${name}: ${err.message}`);
+        logger.error({ adapter: name, eventType, err: err.message }, '[EventBus] Adapter publish failed');
+        this._metrics.errors++;
+      }
+    }
+
+    try {
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+    } catch (err) {
+      spanFactory.recordError(span, err);
+      span.end();
+    }
+
+    return {
+      published: true,
+      deduplicated: false,
+      consumed,
+      adapterAttempted,
+      adapterFailures,
+      adapterErrors,
+    };
+  }
+
+  _isDuplicate(event) {
+    const eventId = event.metadata?.eventId;
+    if (!eventId) return false;
+
+    const now = performance.now();
+    this._pruneExpiredDeduplication(now);
+    if (this._deduplication.has(eventId)) {
+      return true;
+    }
+
+    // Map iteration follows insertion order, which is also timestamp order.
+    // Under a burst, prefer the newest IDs without scanning the whole map.
+    if (this._deduplication.size >= MAX_DEDUPLICATION_ENTRIES) {
+      this._deduplication.delete(this._deduplication.keys().next().value);
+    }
+    this._deduplication.set(eventId, now);
+    this._ensureDeduplicationCleanupTimer();
+    return false;
+  }
+
+  _pruneExpiredDeduplication(now) {
+    const cutoff = now - this._deduplicationWindowMs;
+    while (this._deduplication.size > 0) {
+      const [eventId, timestamp] = this._deduplication.entries().next().value;
+      if (timestamp > cutoff) break;
+      this._deduplication.delete(eventId);
+    }
+  }
+
+  _ensureDeduplicationCleanupTimer() {
+    if (this._deduplicationCleanupTimer) return;
+    const interval = Math.max(1, Math.floor(this._deduplicationWindowMs / 2));
+    this._deduplicationCleanupTimer = setInterval(() => {
+      this._pruneExpiredDeduplication(performance.now());
+      if (this._deduplication.size === 0) {
+        clearInterval(this._deduplicationCleanupTimer);
+        this._deduplicationCleanupTimer = null;
+      }
+    }, interval);
+    this._deduplicationCleanupTimer.unref?.();
+  }
+
+  async _publishToAdapters(event, options) {
+    const eventType = event.metadata?.eventType || event.eventType;
+    const targetAdapters = options.adapters || null;
+    for (const [name, adapter] of this._adapters) {
+      if (targetAdapters && !targetAdapters.includes(name)) continue;
+      try {
+        if (typeof adapter.publish === 'function') {
+          await adapter.publish(event);
+        }
+      } catch (err) {
+        logger.error({ adapter: name, eventType, err: err.message }, '[EventBus] Adapter publish failed');
+        this._metrics.errors++;
+      }
+    }
+  }
+
+  clearMetrics() {
+    this._metrics = { published: 0, subscribed: 0, errors: 0, deduplicated: 0 };
+  }
+}
+
+const eventBus = new EventBus();
+
+export { EventBus };
+export default eventBus;

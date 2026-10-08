@@ -1,0 +1,163 @@
+import fs from 'fs';
+import path from 'path';
+import { OpenAI } from 'openai';
+import axios from 'axios';
+import logger from '../../middleware/logger.js';
+
+const DEFAULT_LLM_MAX_OUTPUT_TOKENS = 120;
+const DEFAULT_TTS_MAX_RESPONSE_CHARS = 800;
+
+function loadPositiveIntegerEnv(name, fallback) {
+  const rawValue = process.env[name];
+  if (rawValue == null || rawValue === '') return fallback;
+
+  const value = Number(rawValue);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+
+  return value;
+}
+
+const LLM_MAX_OUTPUT_TOKENS = loadPositiveIntegerEnv(
+  'VOICE_AI_MAX_OUTPUT_TOKENS',
+  DEFAULT_LLM_MAX_OUTPUT_TOKENS
+);
+const TTS_MAX_RESPONSE_CHARS = loadPositiveIntegerEnv(
+  'VOICE_AI_MAX_RESPONSE_CHARS',
+  DEFAULT_TTS_MAX_RESPONSE_CHARS
+);
+
+class VoiceAiService {
+  constructor() {
+    // The OpenAI SDK throws when no API key is configured, so the client is
+    // created on first use. Constructing it here made importing this module
+    // (and therefore booting the API) fail whenever OPENAI_API_KEY was unset.
+    this._openai = null;
+    this.elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
+    
+    // Voice IDs for different languages
+    this.voiceIds = {
+      en: 'EXAVITQu4vr4xnSDxMaL', // Example ElevenLabs Voice ID for English (e.g. Bella or Adam)
+      hi: 'pNInz6obpgDQGcFmaJgB', // Example Voice ID (Adam is multilingual)
+      ta: 'pNInz6obpgDQGcFmaJgB'  // Example Voice ID
+    };
+  }
+
+  /**
+   * Lazily created OpenAI client.
+   * @returns {OpenAI}
+   * @throws {Error} If OPENAI_API_KEY is not configured
+   */
+  get openai() {
+    if (!this._openai) {
+      const apiKey = (process.env.OPENAI_API_KEY || '').trim();
+      if (!apiKey) {
+        throw new Error('VoiceAiService: OPENAI_API_KEY is not configured');
+      }
+      this._openai = new OpenAI({ apiKey });
+    }
+    return this._openai;
+  }
+
+  /**
+   * Process a voice query end-to-end
+   * @param {string} audioFilePath - Path to the uploaded audio file
+   * @param {string} language - 'en', 'hi', or 'ta'
+   * @returns {Promise<stream.Readable>} Audio stream from ElevenLabs
+   */
+  async processVoiceQuery(audioFilePath, languageParam = 'en') {
+    // Validate and sanitize language to prevent Prompt Injection (CodeQL fix)
+    const allowedLanguages = {
+      'en': 'English',
+      'hi': 'Hindi',
+      'ta': 'Tamil'
+    };
+    const language = allowedLanguages[languageParam] ? languageParam : 'en';
+    const languageName = allowedLanguages[language];
+
+    // Secure the file path to prevent path traversal (CodeQL fix)
+    const safeFileName = path.basename(audioFilePath);
+    const safePath = path.resolve(process.cwd(), 'uploads', 'voice', safeFileName);
+
+    if (safePath !== path.resolve(audioFilePath)) {
+      throw new Error('Security Error: Invalid file path detected.');
+    }
+
+    try {
+      // 1. Transcribe Audio using Whisper
+      logger.info(`Starting transcription for language: ${languageName} (${language})`);
+      const transcription = await this.openai.audio.transcriptions.create({
+        file: fs.createReadStream(safePath),
+        model: 'whisper-1',
+        language: language,
+      });
+      
+      const userText = transcription.text;
+      logger.info(
+        { language, transcriptLength: typeof userText === 'string' ? userText.length : 0 },
+        'Voice transcription completed',
+      );
+
+      // 2. Generate LLM Response
+      const completion = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { 
+            role: 'system', 
+            content: `You are the Truxify Driver Voice Assistant. Answer logistics queries concisely in ${languageName}. Examples: "Where is my truck?", "When will I get paid?". Keep responses under 2 sentences.` 
+          },
+          { role: 'user', content: userText }
+        ],
+        max_completion_tokens: LLM_MAX_OUTPUT_TOKENS,
+      });
+
+      const llmResponseText = completion.choices?.[0]?.message?.content;
+      if (typeof llmResponseText !== 'string' || !llmResponseText.trim()) {
+        throw new Error('LLM returned an empty response');
+      }
+
+      const responseText = llmResponseText.trim();
+      if (responseText.length > TTS_MAX_RESPONSE_CHARS) {
+        throw new Error('LLM response exceeds the voice response limit');
+      }
+
+      logger.info(
+        { language, responseLength: typeof responseText === 'string' ? responseText.length : 0 },
+        'LLM response generated',
+      );
+
+      // 3. Convert Text to Speech using ElevenLabs
+      const voiceId = this.voiceIds[language] || this.voiceIds['en'];
+      const ttsResponse = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
+        {
+          text: responseText,
+          model_id: 'eleven_multilingual_v2',
+        },
+        {
+          headers: {
+            'Accept': 'audio/mpeg',
+            'xi-api-key': this.elevenLabsApiKey,
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+          timeout: Number(process.env.VOICE_AI_TIMEOUT_MS) || 20000,
+        }
+      );
+
+      return ttsResponse.data; // This is a readable stream
+
+    } catch (error) {
+      logger.error(`Voice AI Pipeline Error: ${error.message}`);
+      throw error;
+    } finally {
+      // Clean up the temporary uploaded file securely
+      if (fs.existsSync(safePath)) {
+        fs.unlinkSync(safePath);
+      }
+    }
+  }
+}
+
+export default new VoiceAiService();

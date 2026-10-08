@@ -1,0 +1,267 @@
+{
+  "name": "Demand Forecast Model Auto-Rollback Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "hours": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "id": "schedule-trigger",
+      "name": "Schedule Check"
+    },
+    {
+      "parameters": {
+        "url": "http://ml-engine:8000/models/demand/status",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{$env.ML_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [200, 0],
+      "id": "check-demand-model",
+      "name": "Check Active Demand Model"
+    },
+    {
+      "parameters": {
+        "url": "http://ml-engine:8000/models/demand/status",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{$env.ML_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [400, 0],
+      "id": "evaluate-demand-model",
+      "name": "Evaluate Demand Model"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $input.item.json;\nreturn {\n  model: data.model,\n  active_version: data.active_version,\n  previous_version: data.previous_version,\n  should_rollback: Boolean(data.should_rollback),\n  action: data.should_rollback ? 'rollback' : 'keep_active',\n  evaluated_at: new Date().toISOString()\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 0],
+      "id": "decision-node",
+      "name": "Demand Rollback Decision"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.should_rollback}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [800, 0],
+      "id": "rollback-branch",
+      "name": "Should Roll Back Demand Model?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ml-engine:8000/train/demand/rollback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{$env.ML_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1000, -100],
+      "id": "execute-rollback",
+      "name": "Restore Previous Demand Model"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$response.statusCode}}",
+              "operator": "smallerEqual",
+              "value2": 299
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1200, -100],
+      "id": "rollback-http-ok",
+      "name": "Rollback HTTP Status OK?"
+    },
+    {
+      "parameters": {
+        "toEmail": "ml-alerts@truxify.org",
+        "subject": "Demand Forecast Rollback: {{$node[\"Demand Rollback Decision\"].json.active_version}}",
+        "htmlFormat": true,
+        "message": "<h3>Demand Forecast Rollback — Succeeded</h3><p>Model performance degradation was detected for active generation: <strong>{{$node[\"Demand Rollback Decision\"].json.active_version}}</strong>.</p><p>The system successfully rolled back to the previous model version: <strong>{{$node[\"Demand Rollback Decision\"].json.previous_version}}</strong>.</p><p>Rollback confirmed at {{$node[\"Demand Rollback Decision\"].json.evaluated_at}}.</p>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1.1,
+      "position": [1400, -200],
+      "id": "send-alert",
+      "name": "Send Demand Rollback Alert"
+    },
+    {
+      "parameters": {
+        "toEmail": "ml-alerts@truxify.org",
+        "subject": "CRITICAL: Demand Forecast Rollback FAILED — Manual Intervention Required",
+        "htmlFormat": true,
+        "message": "<h3 style=\"color:#c0392b;\">Demand Forecast Rollback FAILED</h3><p>The automated rollback of the demand forecast model encountered an error.</p><p><strong>Active (degraded) version:</strong> {{$node[\"Demand Rollback Decision\"].json.active_version}}</p><p><strong>Target rollback version:</strong> {{$node[\"Demand Rollback Decision\"].json.previous_version}}</p><p><strong>HTTP Status from rollback API:</strong> {{$response.statusCode}}</p><p>The active model may still be the degraded version. Please investigate immediately and trigger a manual rollback if needed.</p><p>Evaluated at: {{$node[\"Demand Rollback Decision\"].json.evaluated_at}}</p>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1.1,
+      "position": [1400, 0],
+      "id": "send-failure-alert",
+      "name": "Send Rollback Failure Alert"
+    },
+    {
+      "parameters": {
+        "toEmail": "ml-alerts@truxify.org",
+        "subject": "ML Model Health Check: Demand Forecast Model Healthy",
+        "htmlFormat": true,
+        "message": "<h3>Demand Forecast Model Health Check — No Rollback Needed</h3><p>The hourly model health check completed. The active demand forecast model is performing within acceptable thresholds.</p><p><strong>Active Version:</strong> {{$node[\"Demand Rollback Decision\"].json.active_version}}</p><p>Evaluated at: {{$node[\"Demand Rollback Decision\"].json.evaluated_at}}</p>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1.1,
+      "position": [1000, 100],
+      "id": "send-healthy-email",
+      "name": "Notify Model Healthy"
+    }
+  ],
+  "connections": {
+    "schedule-trigger": {
+      "main": [
+        [
+          {
+            "node": "check-demand-model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check-demand-model": {
+      "main": [
+        [
+          {
+            "node": "evaluate-demand-model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "evaluate-demand-model": {
+      "main": [
+        [
+          {
+            "node": "decision-node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "decision-node": {
+      "main": [
+        [
+          {
+            "node": "rollback-branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "rollback-branch": {
+      "main": [
+        [
+          {
+            "node": "execute-rollback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send-healthy-email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "execute-rollback": {
+      "main": [
+        [
+          {
+            "node": "rollback-http-ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "rollback-http-ok": {
+      "main": [
+        [
+          {
+            "node": "send-alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send-failure-alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "versionId": "ml-rollback-v2",
+  "id": "ml-rollback-workflow"
+}
